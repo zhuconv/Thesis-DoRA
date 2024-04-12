@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
 import math
 import re
 import warnings
@@ -27,6 +26,7 @@ from transformers.pytorch_utils import Conv1D
 
 from ..import_utils import is_bnb_4bit_available, is_bnb_available
 from ..utils import (
+    CLAMP_QUANTILE,
     COMMON_LAYERS_PATTERN,
     TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING,
     ModulesToSaveWrapper,
@@ -40,11 +40,6 @@ from ..utils import (
 
 if is_bnb_available():
     import bitsandbytes as bnb
-
-
-def get_device():
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    return f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
 
 
 @dataclass
@@ -96,7 +91,12 @@ class LoraConfig(PeftConfig):
     )
     init_lora_weights: bool = field(
         default=True,
-        metadata={"help": "Whether to initialize the weights of the Lora layers."},
+        metadata={
+            "help": (
+                "Whether to initialize the weights of the Lora layers with their default initialization. Don't change "
+                "this setting, except if you know exactly what you're doing."
+            ),
+        },
     )
     layers_to_transform: Optional[Union[List, int]] = field(
         default=None,
@@ -175,53 +175,20 @@ class LoraModel(torch.nn.Module):
     def __init__(self, model, config, adapter_name):
         super().__init__()
         self.model = model
+        self.forward = self.model.forward
         self.peft_config = config
         self.add_adapter(adapter_name, self.peft_config[adapter_name])
-        print(adapter_name, config)
-        self.norm_penalty = config[adapter_name].custom["norm_penalty"]
-        self.norm_alpha = config[adapter_name].custom["norm_alpha"]
 
-    def forward(self, *args, **kwargs):
-        outputs = self.model.forward(*args, **kwargs)
-
-        norm_layers = []
-        norm_type = 0
-        if self.norm_penalty == 0:
-            return outputs
-        elif self.norm_penalty == 11:
-            norm_type = 1
-            norm_layers = ["lora_d.default"]
-        elif self.norm_penalty == 12:
-            norm_type = 1
-            norm_layers = ["lora_d.default", "lora_b.default"]
-        elif self.norm_penalty == 21:
-            norm_type = 2
-            norm_layers = ["lora_d.default"]
-        elif self.norm_penalty == 22:
-            norm_type = 2
-            norm_layers = ["lora_d.default", "lora_b.default"]
-        else:
-            raise ValueError("Invalid norm penalty")
-
-        if hasattr(outputs, "loss"):
-            total_params = 0
-            regularization_loss = 0.0
-            for n, p in self.model.named_parameters():
-                # if n.endswith("lora_d.default"):
-                if any([n.endswith(layer) for layer in norm_layers]):
-                    total_params += torch.numel(p)
-                    regularization_loss += torch.norm(p, norm_type) ** 2
-            if total_params > 0:
-                regularization_loss = regularization_loss / total_params
-            else:
-                regularization_loss = 0
-            outputs.loss += self.norm_alpha * regularization_loss
-
-        return outputs
+        # transformers models have a .config attribute, whose presence is assumed later on
+        if not hasattr(self, "config"):
+            self.config = {"model_type": "custom"}
 
     def add_adapter(self, adapter_name, config=None):
         if config is not None:
-            model_config = self.model.config.to_dict() if hasattr(self.model.config, "to_dict") else self.model.config
+            model_config = getattr(self.model, "config", {"model_type": "custom"})
+            if hasattr(model_config, "to_dict"):
+                model_config = model_config.to_dict()
+
             config = self._prepare_lora_config(config, model_config)
             self.peft_config[adapter_name] = config
         self._find_and_replace(adapter_name)
@@ -276,7 +243,6 @@ class LoraModel(torch.nn.Module):
             "lora_dropout": lora_config.lora_dropout,
             "fan_in_fan_out": lora_config.fan_in_fan_out,
             "init_lora_weights": lora_config.init_lora_weights,
-            "custom": lora_config.custom,
         }
         loaded_in_4bit = getattr(self.model, "is_loaded_in_4bit", False)
         loaded_in_8bit = getattr(self.model, "is_loaded_in_8bit", False)
@@ -328,6 +294,7 @@ class LoraModel(torch.nn.Module):
                 in_features, out_features = (
                     target.weight.ds_shape if hasattr(target.weight, "ds_shape") else target.weight.shape
                 )
+                kwargs["is_target_conv_1d_layer"] = True
                 if not kwargs["fan_in_fan_out"]:
                     warnings.warn(
                         "fan_in_fan_out is set to False but the target module is `Conv1D`. "
@@ -364,6 +331,15 @@ class LoraModel(torch.nn.Module):
                     lora_config.lora_dropout,
                     lora_config.init_lora_weights,
                 )
+            elif isinstance(target, LoraLayer) and isinstance(target, torch.nn.Embedding):
+                target.update_layer_embedding(
+                    adapter_name,
+                    lora_config.r,
+                    lora_config.lora_alpha,
+                    lora_config.lora_dropout,
+                    lora_config.init_lora_weights,
+                )
+
             elif isinstance(target, LoraLayer):
                 target.update_layer(
                     adapter_name,
@@ -436,11 +412,17 @@ class LoraModel(torch.nn.Module):
                 module.active_adapter = adapter_name
 
     def merge_adapter(self):
+        """
+        This method merges the LoRa layers into the base model.
+        """
         for module in self.model.modules():
             if isinstance(module, LoraLayer):
                 module.merge()
 
     def unmerge_adapter(self):
+        """
+        This method unmerges the LoRa layers from the base model.
+        """
         for module in self.model.modules():
             if isinstance(module, LoraLayer):
                 module.unmerge()
@@ -453,26 +435,7 @@ class LoraModel(torch.nn.Module):
             peft_config.target_modules = TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING[model_config["model_type"]]
         return peft_config
 
-    def merge_and_unload(self):
-        r"""
-        This method merges the LoRa layers into the base model. This is needed if someone wants to use the base model
-        as a standalone model.
-
-        Example:
-
-        ```py
-        >>> from transformers import AutoModelForCausalLM
-        >>> from peft import PeftModel
-
-        >>> base_model = AutoModelForCausalLM.from_pretrained("tiiuae/falcon-40b")
-        >>> peft_model_id = "smangrul/falcon-40B-int4-peft-lora-sfttrainer-sample"
-        >>> model = PeftModel.from_pretrained(base_model, peft_model_id)
-        >>> merged_model = model.merge_and_unload()
-        ```
-        """
-        if getattr(self.config, "model_type", None) == "gpt2":
-            raise ValueError("GPT2 models are not supported for merging LORA layers")
-
+    def _unload_and_optionally_merge(self, merge=True):
         if getattr(self.model, "is_loaded_in_8bit", False) or getattr(self.model, "is_loaded_in_4bit", False):
             raise ValueError("Cannot merge LORA layers when the model is loaded in 8-bit mode")
 
@@ -496,8 +459,12 @@ class LoraModel(torch.nn.Module):
                     )
                 else:
                     bias = target.bias is not None
-                    new_module = torch.nn.Linear(target.in_features, target.out_features, bias=bias)
-                target.merge()
+                    if getattr(target, "is_target_conv_1d_layer", False):
+                        new_module = Conv1D(target.out_features, target.in_features)
+                    else:
+                        new_module = torch.nn.Linear(target.in_features, target.out_features, bias=bias)
+                if merge:
+                    target.merge()
                 self._replace_module(parent, target_name, new_module, target)
 
             # save any additional trainable modules part of `modules_to_save`
@@ -506,12 +473,37 @@ class LoraModel(torch.nn.Module):
 
         return self.model
 
-    def add_weighted_adapter(self, adapters, weights, adapter_name):
-        if len({self.peft_config[adapter].r for adapter in adapters}) != 1:
-            raise ValueError("All adapters must have the same r value")
-        self.peft_config[adapter_name] = replace(
-            self.peft_config[adapters[0]], lora_alpha=self.peft_config[adapters[0]].r
-        )
+    def add_weighted_adapter(self, adapters, weights, adapter_name, combination_type="svd"):
+        """
+        This method adds a new adapter by merging the given adapters with the given weights.
+
+        Args:
+            adapters (list): List of adapter names to be merged.
+            weights (list): List of weights for each adapter.
+            adapter_name (str): Name of the new adapter.
+            combination_type (str): Type of merging. Can be one of [`svd`, `linear`]
+        """
+        if adapter_name in list(self.peft_config.keys()):
+            return
+        for adapter in adapters:
+            if adapter not in list(self.peft_config.keys()):
+                raise ValueError(f"Adapter {adapter} does not exist")
+
+        # if there is only one adapter, we can only use linear merging
+        combination_type = "linear" if len(adapters) == 1 else combination_type
+
+        # new rank is the max of all ranks of the adapters
+        unique_ranks = list({self.peft_config[adapter].r for adapter in adapters})
+        if combination_type == "linear":
+            if len(unique_ranks) != 1:
+                raise ValueError("All adapters must have the same r value when using `linear` combination_type")
+            new_rank = unique_ranks[0]
+        elif combination_type == "svd":
+            new_rank = max(unique_ranks)
+        else:
+            raise ValueError(f"Invalid combination_type: {combination_type}")
+
+        self.peft_config[adapter_name] = replace(self.peft_config[adapters[0]], r=new_rank, lora_alpha=new_rank)
         self._find_and_replace(adapter_name)
         mark_only_lora_as_trainable(self.model, self.peft_config[adapter_name].bias)
         _freeze_adapter(self.model, adapter_name)
@@ -520,26 +512,117 @@ class LoraModel(torch.nn.Module):
             _, target, _ = _get_submodules(self.model, key)
             if isinstance(target, LoraLayer):
                 if adapter_name in target.lora_A:
-                    target.lora_A[adapter_name].weight.data = target.lora_A[adapter_name].weight.data * 0.0
-                    target.lora_B[adapter_name].weight.data = target.lora_B[adapter_name].weight.data * 0.0
-                    for adapter, weight in zip(adapters, weights):
-                        if adapter not in target.lora_A:
-                            continue
-                        target.lora_A[adapter_name].weight.data += (
-                            target.lora_A[adapter].weight.data * weight * target.scaling[adapter]
-                        )
-                        target.lora_B[adapter_name].weight.data += target.lora_B[adapter].weight.data * weight
-
+                    target_lora_A = target.lora_A[adapter_name].weight
+                    target_lora_B = target.lora_B[adapter_name].weight
                 elif adapter_name in target.lora_embedding_A:
-                    target.lora_embedding_A[adapter_name].data = target.lora_embedding_A[adapter_name].data * 0.0
-                    target.lora_embedding_B[adapter_name].data = target.lora_embedding_B[adapter_name].data * 0.0
+                    target_lora_A = target.lora_embedding_A[adapter_name]
+                    target_lora_B = target.lora_embedding_B[adapter_name]
+
+                target_lora_A.data = target_lora_A.data * 0.0
+                target_lora_B.data = target_lora_B.data * 0.0
+                if combination_type == "linear":
                     for adapter, weight in zip(adapters, weights):
-                        if adapter not in target.lora_embedding_A:
-                            continue
-                        target.lora_embedding_A[adapter_name].data += (
-                            target.lora_embedding_A[adapter].data * weight * target.scaling[adapter]
-                        )
-                        target.lora_embedding_B[adapter_name].data += target.lora_embedding_B[adapter].data * weight
+                        if adapter in target.lora_A:
+                            current_adapter_lora_A = target.lora_A[adapter].weight
+                            current_adapter_lora_B = target.lora_B[adapter].weight
+                        elif adapter in target.lora_embedding_A:
+                            current_adapter_lora_A = target.lora_embedding_A[adapter]
+                            current_adapter_lora_B = target.lora_embedding_B[adapter]
+                        target_lora_A.data += current_adapter_lora_A.data * weight * target.scaling[adapter]
+                        target_lora_B.data += current_adapter_lora_B.data
+                elif combination_type == "svd":
+                    target_lora_A.data, target_lora_B.data = self._svd_weighted_adapter(
+                        adapters, weights, new_rank, target, target_lora_A, target_lora_B
+                    )
+
+    def _svd_weighted_adapter(self, adapters, weights, new_rank, target, target_lora_A, target_lora_B):
+        delta_weight = weights[0] * target.get_delta_weight(adapters[0])
+        for adapter, weight in zip(adapters[1:], weights[1:]):
+            delta_weight += weight * target.get_delta_weight(adapter)
+        conv2d = isinstance(target, Conv2d)
+        if conv2d:
+            conv2d_1x1 = target.weight.size()[2:4] == (1, 1)
+            if not conv2d_1x1:
+                delta_weight = delta_weight.flatten(start_dim=1)
+            else:
+                delta_weight = delta_weight.squeeze()
+        if target.fan_in_fan_out:
+            delta_weight = delta_weight.T
+
+        # based on https://github.com/kohya-ss/sd-scripts/blob/main/networks/svd_merge_lora.py#L114-L131
+        U, S, Vh = torch.linalg.svd(delta_weight)
+        U = U[:, :new_rank]
+        S = S[:new_rank]
+        U = U @ torch.diag(S)
+        Vh = Vh[:new_rank, :]
+        dist = torch.cat([U.flatten(), Vh.flatten()])
+        hi_val = torch.quantile(dist, CLAMP_QUANTILE)
+        low_val = -hi_val
+        U = U.clamp(low_val, hi_val)
+        Vh = Vh.clamp(low_val, hi_val)
+        if conv2d:
+            U = U.reshape(target_lora_B.data.shape)
+            Vh = Vh.reshape(target_lora_A.data.shape)
+        return Vh, U
+
+    def delete_adapter(self, adapter_name):
+        """
+        Deletes an existing adapter.
+
+        Args:
+            adapter_name (str): Name of the adapter to be deleted.
+        """
+        if adapter_name not in list(self.peft_config.keys()):
+            raise ValueError(f"Adapter {adapter_name} does not exist")
+        del self.peft_config[adapter_name]
+        key_list = [key for key, _ in self.model.named_modules() if "lora" not in key]
+        for key in key_list:
+            _, target, _ = _get_submodules(self.model, key)
+            if isinstance(target, LoraLayer):
+                for attr in [
+                    "r",
+                    "lora_alpha",
+                    "scaling",
+                    "lora_A",
+                    "lora_B",
+                    "lora_embedding_A",
+                    "lora_embedding_B",
+                    "lora_dropout",
+                ]:
+                    if adapter_name in getattr(target, attr):
+                        getattr(target, attr).pop(adapter_name)
+                if target.active_adapter == adapter_name:
+                    resetting_active_adapter = list(self.peft_config.keys())[0]
+                    warnings.warn(
+                        f"Adapter {adapter_name} was active which is now deleted. Setting active adapter to {resetting_active_adapter}. "
+                    )
+                    target.active_adapter = resetting_active_adapter
+
+    def merge_and_unload(self):
+        r"""
+        This method merges the LoRa layers into the base model. This is needed if someone wants to use the base model
+        as a standalone model.
+
+        Example:
+
+        ```py
+        >>> from transformers import AutoModelForCausalLM
+        >>> from peft import PeftModel
+
+        >>> base_model = AutoModelForCausalLM.from_pretrained("tiiuae/falcon-40b")
+        >>> peft_model_id = "smangrul/falcon-40B-int4-peft-lora-sfttrainer-sample"
+        >>> model = PeftModel.from_pretrained(base_model, peft_model_id)
+        >>> merged_model = model.merge_and_unload()
+        ```
+        """
+        return self._unload_and_optionally_merge()
+
+    def unload(self):
+        """
+        Gets back the base model by removing all the lora modules without merging. This gives back the original base
+        model.
+        """
+        return self._unload_and_optionally_merge(merge=False)
 
 
 # Below code is based on https://github.com/microsoft/LoRA/blob/main/loralib/layers.py
@@ -572,16 +655,13 @@ def mark_only_lora_as_trainable(model: nn.Module, bias: str = "none") -> None:
 
 
 class LoraLayer:
-    def __init__(self, in_features: int, out_features: int, fan_in_fan_out: bool, custom, **kwargs):
+    def __init__(self, in_features: int, out_features: int, **kwargs):
         self.r = {}
         self.lora_alpha = {}
         self.scaling = {}
         self.lora_dropout = nn.ModuleDict({})
         self.lora_A = nn.ModuleDict({})
         self.lora_B = nn.ModuleDict({})
-        self.lora_d = nn.ParameterDict({})
-        self.lora_da = nn.ParameterDict({})
-        self.lora_db = nn.ParameterDict({})
         # For Embedding layer
         self.lora_embedding_A = nn.ParameterDict({})
         self.lora_embedding_B = nn.ParameterDict({})
@@ -591,12 +671,9 @@ class LoraLayer:
         self.in_features = in_features
         self.out_features = out_features
         self.kwargs = kwargs
-        self.fan_in_fan_out = fan_in_fan_out
-        self.custom = custom
 
     def update_layer(self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights):
         self.r[adapter_name] = r
-        self.scaling[adapter_name] = lora_alpha / math.sqrt(r)
         self.lora_alpha[adapter_name] = lora_alpha
         if lora_dropout > 0.0:
             lora_dropout_layer = nn.Dropout(p=lora_dropout)
@@ -606,269 +683,14 @@ class LoraLayer:
         self.lora_dropout.update(nn.ModuleDict({adapter_name: lora_dropout_layer}))
         # Actual trainable parameters
         if r > 0:
-            if self.custom["shared_dim"] is None:
-                _lora_A = nn.Linear(
-                    self.in_features,
-                    r,
-                    bias=False,
-                    dtype=torch.float64 if self.custom["use_float64"] else torch.float32,
-                )
-                _lora_B = nn.Linear(
-                    r,
-                    self.out_features,
-                    bias=False,
-                    dtype=torch.float64 if self.custom["use_float64"] else torch.float32,
-                )
-            else:
-                if self.custom["shared_matrices"] is None:
-                    _lora_A = nn.Linear(
-                        self.custom["shared_dim"]["A"],
-                        r,
-                        bias=False,
-                        dtype=torch.float64 if self.custom["use_float64"] else torch.float32,
-                    )
-                    _lora_B = nn.Linear(
-                        r,
-                        self.custom["shared_dim"]["B"],
-                        bias=False,
-                        dtype=torch.float64 if self.custom["use_float64"] else torch.float32,
-                    )
-                    self.custom["shared_matrices"] = {"A": _lora_A, "B": _lora_B}
-                else:
-                    _lora_A = self.custom["shared_matrices"]["A"]
-                    _lora_B = self.custom["shared_matrices"]["B"]
-                if "dynamic_uv" in self.custom and self.custom["dynamic_uv"]:
-                    _lora_A = nn.Linear(
-                        self.in_features,
-                        r,
-                        bias=False,
-                        dtype=torch.float64 if self.custom["use_float64"] else torch.float32,
-                    )
-                    _lora_B = nn.Linear(
-                        r,
-                        self.out_features,
-                        bias=False,
-                        dtype=torch.float64 if self.custom["use_float64"] else torch.float32,
-                    )
-                    _lora_A.weight.data = self.custom["shared_matrices"]["A"].weight.data[:r, : self.in_features]
-                    _lora_B.weight.data = self.custom["shared_matrices"]["B"].weight.data[: self.out_features, :r]
-            self.lora_A.update(nn.ModuleDict({adapter_name: _lora_A}))
-            self.lora_B.update(nn.ModuleDict({adapter_name: _lora_B}))
-            if self.custom["mode"] != "lora":
-                if not self.custom["trainable_uv"]:
-                    self.lora_A.requires_grad_(False)
-                    self.lora_B.requires_grad_(False)
-                if self.custom["d_init_type"] == 0:
-
-                    def d_init_fn(dim, component="d"):
-                        return (
-                            torch.randn(dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32)
-                            * self.custom["d_init"]
-                        )
-
-                elif self.custom["d_init_type"] == 1:
-
-                    def d_init_fn(dim, component="d"):
-                        return torch.ones(dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32)
-
-                elif self.custom["d_init_type"] == 2:
-
-                    def d_init_fn(dim, component="d"):
-                        return (
-                            torch.randn(dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32)
-                            / 10.0
-                            + 1
-                        )
-
-                elif self.custom["d_init_type"] == 3:
-
-                    def d_init_fn(dim, component="d"):
-                        return (
-                            torch.randn(dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32)
-                            / 100.0
-                            + 1
-                        )
-
-                elif self.custom["d_init_type"] == 4:
-
-                    def d_init_fn(dim, component="d"):
-                        if isinstance(dim, int):
-                            dim = (dim,)
-                        return torch.full(
-                            dim, 1e-7, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                        )
-
-                elif self.custom["d_init_type"] == 91:
-
-                    def d_init_fn(dim, component="d"):
-                        if component == "d":
-                            return torch.zeros(
-                                dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                            )
-                        else:
-                            return torch.ones(
-                                dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                            )
-
-                elif self.custom["d_init_type"] == 92:
-
-                    def d_init_fn(dim, component="d"):
-                        if component == "b":
-                            return torch.zeros(
-                                dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                            )
-                        else:
-                            return torch.ones(
-                                dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                            )
-
-                elif self.custom["d_init_type"] == 93:
-
-                    def d_init_fn(dim, component="d"):
-                        if isinstance(dim, int):
-                            dim = (dim,)
-                        if component == "b":
-                            return torch.ones(
-                                dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                            )
-                        else:
-                            return torch.full(
-                                dim, 1e-7, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                            )
-
-                elif self.custom["d_init_type"] == 94:
-
-                    def d_init_fn(dim, component="d"):
-                        if isinstance(dim, int):
-                            dim = (dim,)
-                        if component == "b":
-                            return torch.zeros(
-                                dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                            )
-                        else:
-                            return torch.full(
-                                dim, 0.1, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                            )
-
-                elif self.custom["d_init_type"] == 95:
-
-                    def d_init_fn(dim, component="d"):
-                        if isinstance(dim, int):
-                            dim = (dim,)
-                        if component == "d":
-                            return torch.full(
-                                dim, 0.001, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                            )
-                        else:
-                            return torch.zeros(
-                                dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                            )
-
-                elif self.custom["d_init_type"] == 96:
-
-                    def d_init_fn(dim, component="d"):
-                        if isinstance(dim, int):
-                            dim = (dim,)
-                        if component == "d":
-                            return torch.full(
-                                dim, 0.5, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                            )
-                        else:
-                            return torch.zeros(
-                                dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                            )
-
-                elif self.custom["d_init_type"] == 97:
-
-                    def d_init_fn(dim, component="d"):
-                        if isinstance(dim, int):
-                            dim = (dim,)
-                        if component == "d":
-                            return torch.full(
-                                dim, 0.01, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                            )
-                        else:
-                            return torch.zeros(
-                                dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                            )
-
-                elif self.custom["d_init_type"] == 98:
-
-                    def d_init_fn(dim, component="d"):
-                        if isinstance(dim, int):
-                            dim = (dim,)
-                        if component == "b":
-                            return torch.zeros(
-                                dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                            )
-                        else:
-                            return torch.full(
-                                dim, 1e-7, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                            )
-
-                elif self.custom["d_init_type"] == 990:
-
-                    def d_init_fn(dim, component="d"):
-                        if isinstance(dim, int):
-                            dim = (dim,)
-                        if component == "d":
-                            return torch.randn(
-                                dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                            )
-                        else:
-                            return torch.zeros(
-                                dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                            )
-
-                elif self.custom["d_init_type"] == 991:
-
-                    def d_init_fn(dim, component="d"):
-                        if isinstance(dim, int):
-                            dim = (dim,)
-                        if component == "d":
-                            _d = torch.zeros(dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32)
-                            torch.nn.init.trunc_normal_(_d, a=-1.0, b=1.0)
-                            return _d
-                        else:
-                            return torch.zeros(
-                                dim, dtype=torch.float64 if self.custom["use_float64"] else torch.float32
-                            )
-
-                else:
-                    raise NotImplementedError()
-
-                if self.custom["shared_d"]:
-                    if self.custom["shared_d_vector"] is None:
-                        _lora_d = nn.Parameter(d_init_fn(r, "d"))
-                        self.custom["shared_d_vector"] = _lora_d
-                    else:
-                        _lora_d = self.custom["shared_d_vector"]
-                else:
-                    _lora_d = nn.Parameter(d_init_fn(r, "d"))
-
-                if self.custom["mode"] == "elora":
-                    self.lora_db.update(
-                        nn.ParameterDict({adapter_name: nn.Parameter(d_init_fn(self.out_features, "b"))})
-                    )
-                    self.lora_db.requires_grad_(True)
-                    self.lora_d.update(nn.ParameterDict({adapter_name: _lora_d}))
-                    self.lora_d.requires_grad_(True)
-                elif self.custom["mode"] == "only_b":
-                    self.lora_db.update(
-                        nn.ParameterDict({adapter_name: nn.Parameter(d_init_fn(self.out_features, "b"))})
-                    )
-                    self.lora_db.requires_grad_(True)
-                elif self.custom["mode"] == "only_d":
-                    self.lora_d.update(nn.ParameterDict({adapter_name: _lora_d}))
-                    self.lora_d.requires_grad_(True)
-            if self.custom["submode"] == "lora_half" or self.custom["submode"] == "lora_half_svd":
-                self.lora_A.requires_grad_(False)
+            self.lora_A.update(nn.ModuleDict({adapter_name: nn.Linear(self.in_features, r, bias=False)}))
+            self.lora_B.update(nn.ModuleDict({adapter_name: nn.Linear(r, self.out_features, bias=False)}))
+            self.scaling[adapter_name] = lora_alpha / r
         if init_lora_weights:
             self.reset_lora_parameters(adapter_name)
         self.to(self.weight.device)
 
     def update_layer_conv2d(self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights):
-        raise NotImplementedError()
         self.r[adapter_name] = r
         self.lora_alpha[adapter_name] = lora_alpha
         if lora_dropout > 0.0:
@@ -894,7 +716,6 @@ class LoraLayer:
         self.to(self.weight.device)
 
     def update_layer_embedding(self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights):
-        raise NotImplementedError()
         self.r[adapter_name] = r
         self.lora_alpha[adapter_name] = lora_alpha
         if lora_dropout > 0.0:
@@ -905,12 +726,10 @@ class LoraLayer:
         self.lora_dropout.update(nn.ModuleDict({adapter_name: lora_dropout_layer}))
         # Actual trainable parameters
         if r > 0:
-            self.lora_embedding_A.update(
-                nn.ParameterDict({adapter_name: nn.Parameter(self.weight.new_zeros((r, self.in_features)))})
-            )
-            self.lora_embedding_B.update(
-                nn.ParameterDict({adapter_name: nn.Parameter(self.weight.new_zeros((self.out_features, r)))})
-            )
+            weight_A = torch.randn((r, self.in_features), dtype=self.weight.dtype, device=self.weight.device)
+            weight_B = torch.randn((self.out_features, r), dtype=self.weight.dtype, device=self.weight.device)
+            self.lora_embedding_A.update(nn.ParameterDict({adapter_name: nn.Parameter(weight_A)}))
+            self.lora_embedding_B.update(nn.ParameterDict({adapter_name: nn.Parameter(weight_B)}))
             self.scaling[adapter_name] = lora_alpha / r
         if init_lora_weights:
             self.reset_lora_parameters(adapter_name)
@@ -918,71 +737,10 @@ class LoraLayer:
 
     def reset_lora_parameters(self, adapter_name):
         if adapter_name in self.lora_A.keys():
-            sqrt_a = self.custom["sqrt_a"]
-            if self.custom["mode"] == "lora":
-                if self.custom["submode"] == "lora_half_svd" or self.custom["submode"] == "lora_svd":
-                    U, s, V = torch.svd(self.weight.T if self.fan_in_fan_out else self.weight)
-                    U = torch.mm(U, torch.diag(s))
-                    self.lora_A[adapter_name].weight.data = V.T[: self.r[adapter_name], :]
-                    self.lora_B[adapter_name].weight.data = U[:, : self.r[adapter_name]]
-                else:
-                    nn.init.kaiming_uniform_(self.lora_A[adapter_name].weight, a=math.sqrt(sqrt_a))
-                    nn.init.zeros_(self.lora_B[adapter_name].weight)
-
-                if self.custom["identity"]:
-                    self._A = self.lora_A[adapter_name].weight.data.clone().to(get_device())
-                    self._B = self.lora_B[adapter_name].weight.data.clone().to(get_device())
-            else:
-                if (
-                    self.custom["mode"] == "only_d"
-                    or self.custom["mode"] == "elora"
-                    or self.custom["mode"] == "only_b"
-                ):
-                    if self.custom["init_type"] == 0:
-                        nn.init.kaiming_uniform_(self.lora_A[adapter_name].weight, a=math.sqrt(sqrt_a))
-                        nn.init.kaiming_uniform_(self.lora_B[adapter_name].weight, a=math.sqrt(sqrt_a))
-                    elif self.custom["init_type"] == 1:
-                        nn.init.kaiming_uniform_(self.lora_A[adapter_name].weight)
-                        nn.init.kaiming_uniform_(self.lora_B[adapter_name].weight)
-                    elif self.custom["init_type"] == 2:
-                        nn.init.xavier_uniform_(self.lora_A[adapter_name].weight)
-                        nn.init.xavier_uniform_(self.lora_B[adapter_name].weight)
-                    elif self.custom["init_type"] == 3:
-                        nn.init.kaiming_normal_(self.lora_A[adapter_name].weight)
-                        nn.init.kaiming_normal_(self.lora_B[adapter_name].weight)
-                    elif self.custom["init_type"] == 4:
-                        nn.init.xavier_normal_(self.lora_A[adapter_name].weight)
-                        nn.init.xavier_normal_(self.lora_B[adapter_name].weight)
-                    elif self.custom["init_type"] == 5:
-                        nn.init.trunc_normal_(self.lora_A[adapter_name].weight, std=0.02, a=-1.0, b=1.0)
-                        nn.init.trunc_normal_(self.lora_B[adapter_name].weight, std=0.02, a=-1.0, b=1.0)
-                    elif self.custom["init_type"] == 6:
-                        nn.init.uniform_(self.lora_A[adapter_name].weight, a=0.0, b=0.1)
-                        nn.init.uniform_(self.lora_B[adapter_name].weight, a=0.0, b=0.1)
-                    elif self.custom["init_type"] == 10:
-                        nn.init.normal_(self.lora_A[adapter_name].weight)
-                        nn.init.normal_(self.lora_B[adapter_name].weight)
-                        self.lora_A[adapter_name].weight.data *= self.scaling[adapter_name]
-
-                if self.custom["mode"] == "svd":
-                    U, S, V = torch.svd(self.weight.T if self.fan_in_fan_out else self.weight)
-                    self.lora_A[adapter_name].weight.data = V.T[: self.r[adapter_name], :]
-                    self.lora_B[adapter_name].weight.data = U[:, : self.r[adapter_name]]
-                    self.lora_d[adapter_name].data = S.data[: self.r[adapter_name]]
-
-                if self.custom["identity"]:
-                    self._A = self.lora_A[adapter_name].weight.data.clone().to(get_device())
-                    self._B = self.lora_B[adapter_name].weight.data.clone().to(get_device())
-                    if self.custom["mode"] == "elora":
-                        self._db = self.lora_db[adapter_name].data.clone().to(get_device())
-                        self._d = self.lora_d[adapter_name].data.clone().to(get_device())
-                    elif self.custom["mode"] == "only_b":
-                        self._db = self.lora_db[adapter_name].data.clone().to(get_device())
-                    elif self.custom["mode"] == "only_d":
-                        self._d = self.lora_d[adapter_name].data.clone().to(get_device())
-
+            # initialize A the same way as the default for nn.Linear and B to zero
+            nn.init.kaiming_uniform_(self.lora_A[adapter_name].weight, a=math.sqrt(5))
+            nn.init.zeros_(self.lora_B[adapter_name].weight)
         if adapter_name in self.lora_embedding_A.keys():
-            raise NotImplementedError()
             # initialize a the same way as the default for nn.linear and b to zero
             nn.init.zeros_(self.lora_embedding_A[adapter_name])
             nn.init.normal_(self.lora_embedding_B[adapter_name])
@@ -999,15 +757,13 @@ class Linear(nn.Linear, LoraLayer):
         lora_alpha: int = 1,
         lora_dropout: float = 0.0,
         fan_in_fan_out: bool = False,  # Set this to True if the layer to replace stores weight like (fan_in, fan_out)
+        is_target_conv_1d_layer: bool = False,
         **kwargs,
     ):
         init_lora_weights = kwargs.pop("init_lora_weights", True)
-        self.custom = kwargs.pop("custom", True)
 
         nn.Linear.__init__(self, in_features, out_features, **kwargs)
-        LoraLayer.__init__(
-            self, in_features=in_features, out_features=out_features, fan_in_fan_out=fan_in_fan_out, custom=self.custom
-        )
+        LoraLayer.__init__(self, in_features=in_features, out_features=out_features)
         # Freezing the pre-trained weight matrix
         self.weight.requires_grad = False
 
@@ -1018,40 +774,36 @@ class Linear(nn.Linear, LoraLayer):
         nn.Linear.reset_parameters(self)
         self.update_layer(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights)
         self.active_adapter = adapter_name
+        self.is_target_conv_1d_layer = is_target_conv_1d_layer
 
     def merge(self):
-        raise NotImplementedError()
         if self.active_adapter not in self.lora_A.keys():
             return
         if self.merged:
             warnings.warn("Already merged. Nothing to do.")
             return
         if self.r[self.active_adapter] > 0:
-            self.weight.data += (
-                transpose(
-                    self.lora_B[self.active_adapter].weight @ self.lora_A[self.active_adapter].weight,
-                    self.fan_in_fan_out,
-                )
-                * self.scaling[self.active_adapter]
-            )
+            self.weight.data += self.get_delta_weight(self.active_adapter)
             self.merged = True
 
     def unmerge(self):
-        raise NotImplementedError()
         if self.active_adapter not in self.lora_A.keys():
             return
         if not self.merged:
             warnings.warn("Already unmerged. Nothing to do.")
             return
         if self.r[self.active_adapter] > 0:
-            self.weight.data -= (
-                transpose(
-                    self.lora_B[self.active_adapter].weight @ self.lora_A[self.active_adapter].weight,
-                    self.fan_in_fan_out,
-                )
-                * self.scaling[self.active_adapter]
-            )
+            self.weight.data -= self.get_delta_weight(self.active_adapter)
             self.merged = False
+
+    def get_delta_weight(self, adapter):
+        return (
+            transpose(
+                self.lora_B[adapter].weight @ self.lora_A[adapter].weight,
+                self.fan_in_fan_out,
+            )
+            * self.scaling[adapter]
+        )
 
     def forward(self, x: torch.Tensor):
         previous_dtype = x.dtype
@@ -1065,81 +817,14 @@ class Linear(nn.Linear, LoraLayer):
             result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
 
             x = x.to(self.lora_A[self.active_adapter].weight.dtype)
-            x = self.lora_dropout[self.active_adapter](x)
 
-            _scaling = self.scaling[self.active_adapter] if self.custom["custom_scaling"] else 1.0
-
-            if self.active_adapter in self.lora_d.keys():
-                if self.custom["nonlin"] == 0:
-                    d_after = self.lora_d[self.active_adapter]
-                    if hasattr(self, "_d"):
-                        _d_after = self._d
-                elif self.custom["nonlin"] == 1:
-                    d_after = torch.relu(self.lora_d[self.active_adapter])
-                    if hasattr(self, "_d"):
-                        _d_after = torch.relu(self._d)
-                elif self.custom["nonlin"] == 2:
-                    d_after = torch.abs(self.lora_d[self.active_adapter])
-                    if hasattr(self, "_d"):
-                        _d_after = torch.abs(self._d)
-                elif self.custom["nonlin"] == 3:
-                    f = torch.nn.Softplus()
-                    d_after = f(self.lora_d[self.active_adapter])
-                    if hasattr(self, "_d"):
-                        _d_after = f(self._d)
-                elif self.custom["nonlin"] == 4:
-                    f = torch.nn.GELU()
-                    d_after = f(self.lora_d[self.active_adapter])
-                    if hasattr(self, "_d"):
-                        _d_after = f(self._d)
-                elif self.custom["nonlin"] == 5:
-                    d_after = torch.tanh(self.lora_d[self.active_adapter])
-                    if hasattr(self, "_d"):
-                        _d_after = torch.tanh(self._d)
-                elif self.custom["nonlin"] == 6:
-                    d_after = torch.sigmoid(self.lora_d[self.active_adapter])
-                    if hasattr(self, "_d"):
-                        _d_after = torch.sigmoid(self._d)
-                else:
-                    raise NotImplementedError()
-
-            if self.custom["mode"] == "lora":
-                result += (
-                    self.lora_B[self.active_adapter](self.lora_A[self.active_adapter](x))
-                    * self.scaling[self.active_adapter]
+            result += (
+                self.lora_B[self.active_adapter](
+                    self.lora_A[self.active_adapter](self.lora_dropout[self.active_adapter](x))
                 )
-
-                if self.custom["identity"]:
-                    _x2 = x @ self._A.T
-                    _x2 = _x2 @ self._B.T
-                    result -= _x2 * self.scaling[self.active_adapter]
-            elif self.custom["mode"] == "elora":
-                result += self.lora_db[self.active_adapter] * self.lora_B[self.active_adapter](
-                    d_after * self.lora_A[self.active_adapter](x)
-                )
-                if self.custom["identity"]:
-                    result -= (
-                        x @ torch.mm(torch.diag(self._db) @ self._B @ torch.diag(_d_after), self._A).T
-                    ) * _scaling
-            elif self.custom["mode"] == "only_b":
-                result += self.lora_db[self.active_adapter] * self.lora_B[self.active_adapter](
-                    self.lora_A[self.active_adapter](x)
-                )
-                if self.custom["identity"]:
-                    result -= (x @ torch.mm(torch.diag(self._db) @ self._B, self._A).T) * _scaling
-            elif self.custom["mode"] == "only_d":
-                result += self.lora_B[self.active_adapter](d_after * self.lora_A[self.active_adapter](x))
-
-                if self.custom["identity"]:
-                    _d = self._d_after.diag() if len(self._d.shape) == 1 else _d_after
-                    _x2 = x @ self._A.T
-                    _x2 = _x2 @ _d
-                    _x2 = _x2 @ self._B.T
-                    result -= _x2 * _scaling
-            else:
-                raise NotImplementedError()
+                * self.scaling[self.active_adapter]
+            )
         else:
-            raise NotImplementedError()
             result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
 
         result = result.to(previous_dtype)
@@ -1170,17 +855,12 @@ class Embedding(nn.Embedding, LoraLayer):
         self.update_layer_embedding(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights)
         self.active_adapter = adapter_name
 
-    def unmerge(self, mode: bool = True):
+    def unmerge(self):
         if not self.merged:
             warnings.warn("Already unmerged. Nothing to do.")
             return
         if self.r[self.active_adapter] > 0:
-            self.weight.data -= (
-                transpose(
-                    self.lora_embedding_B[self.active_adapter] @ self.lora_embedding_A[self.active_adapter], True
-                )
-                * self.scaling[self.active_adapter]
-            )
+            self.weight.data -= self.get_delta_weight(self.active_adapter)
             self.merged = False
 
     def merge(self):
@@ -1188,27 +868,16 @@ class Embedding(nn.Embedding, LoraLayer):
             warnings.warn("Already merged. Nothing to do.")
             return
         if self.r[self.active_adapter] > 0:
-            self.weight.data += (
-                transpose(
-                    self.lora_embedding_B[self.active_adapter] @ self.lora_embedding_A[self.active_adapter], True
-                )
-                * self.scaling[self.active_adapter]
-            )
+            self.weight.data += self.get_delta_weight(self.active_adapter)
             self.merged = True
 
+    def get_delta_weight(self, adapter):
+        return transpose(self.lora_embedding_B[adapter] @ self.lora_embedding_A[adapter], True) * self.scaling[adapter]
+
     def forward(self, x: torch.Tensor):
-        raise NotImplementedError()
         if self.disable_adapters:
-            if self.r[self.active.adapter] > 0 and self.merged:
-                self.weight.data -= (
-                    transpose(
-                        self.lora_embedding_B[self.active_adapter].weight
-                        @ self.lora_embedding_A[self.active_adapter].weight,
-                        True,
-                    )
-                    * self.scaling[self.active_adapter]
-                )
-                self.merged = False
+            if self.r[self.active_adapter] > 0 and self.merged:
+                self.unmerge()
             return nn.Embedding.forward(self, x)
 
         elif self.r[self.active_adapter] > 0 and not self.merged:
@@ -1269,22 +938,7 @@ class Conv2d(nn.Conv2d, LoraLayer):
             warnings.warn("Already merged. Nothing to do.")
             return
         if self.r[self.active_adapter] > 0:
-            # https://github.com/bmaltais/kohya_ss/blob/feb6728762a8f463d15ba936d189d4c3abfaa1ab/networks/lora.py#L117
-            if self.weight.size()[2:4] == (1, 1):
-                # conv2d 1x1
-                self.weight.data += (
-                    self.lora_B[self.active_adapter].weight.squeeze(3).squeeze(2)
-                    @ self.lora_A[self.active_adapter].weight.squeeze(3).squeeze(2)
-                ).unsqueeze(2).unsqueeze(3) * self.scaling[self.active_adapter]
-            else:
-                # conv2d 3x3
-                self.weight.data += (
-                    F.conv2d(
-                        self.lora_A[self.active_adapter].weight.permute(1, 0, 2, 3),
-                        self.lora_B[self.active_adapter].weight,
-                    ).permute(1, 0, 2, 3)
-                    * self.scaling[self.active_adapter]
-                )
+            self.weight.data += self.get_delta_weight(self.active_adapter)
             self.merged = True
 
     def unmerge(self):
@@ -1294,25 +948,27 @@ class Conv2d(nn.Conv2d, LoraLayer):
             warnings.warn("Already unmerged. Nothing to do.")
             return
         if self.r[self.active_adapter] > 0:
-            if self.weight.size()[2:4] == (1, 1):
-                # conv2d 1x1
-                self.weight.data -= (
-                    self.lora_B[self.active_adapter].weight.squeeze(3).squeeze(2)
-                    @ self.lora_A[self.active_adapter].weight.squeeze(3).squeeze(2)
-                ).unsqueeze(2).unsqueeze(3) * self.scaling[self.active_adapter]
-            else:
-                # conv2d 3x3
-                self.weight.data += (
-                    F.conv2d(
-                        self.lora_A[self.active_adapter].weight.permute(1, 0, 2, 3),
-                        self.lora_B[self.active_adapter].weight,
-                    ).permute(1, 0, 2, 3)
-                    * self.scaling[self.active_adapter]
-                )
+            self.weight.data -= self.get_delta_weight(self.active_adapter)
             self.merged = False
 
+    def get_delta_weight(self, adapter):
+        # https://github.com/bmaltais/kohya_ss/blob/feb6728762a8f463d15ba936d189d4c3abfaa1ab/networks/lora.py#L117
+        if self.weight.size()[2:4] == (1, 1):
+            # conv2d 1x1
+            return (
+                self.lora_B[adapter].weight.squeeze(3).squeeze(2) @ self.lora_A[adapter].weight.squeeze(3).squeeze(2)
+            ).unsqueeze(2).unsqueeze(3) * self.scaling[adapter]
+        else:
+            # conv2d 3x3
+            return (
+                F.conv2d(
+                    self.lora_A[adapter].weight.permute(1, 0, 2, 3),
+                    self.lora_B[adapter].weight,
+                ).permute(1, 0, 2, 3)
+                * self.scaling[adapter]
+            )
+
     def forward(self, x: torch.Tensor):
-        raise NotImplementedError()
         previous_dtype = x.dtype
 
         if self.active_adapter not in self.lora_A.keys():
@@ -1405,7 +1061,6 @@ if is_bnb_available():
             self.active_adapter = adapter_name
 
         def forward(self, x: torch.Tensor):
-            raise NotImplementedError()
             result = super().forward(x)
 
             if self.disable_adapters or self.active_adapter not in self.lora_A.keys():
@@ -1444,11 +1099,8 @@ if is_bnb_available():
                 r: int = 0,
                 lora_alpha: int = 1,
                 lora_dropout: float = 0.0,
-                fan_in_fan_out: bool = False,
                 **kwargs,
             ):
-                self.custom = kwargs.pop("custom", True)
-
                 bnb.nn.Linear4bit.__init__(
                     self,
                     in_features,
@@ -1458,23 +1110,12 @@ if is_bnb_available():
                     compress_statistics=kwargs.get("compress_statistics", True),
                     quant_type=kwargs.get("quant_type", "nf4"),
                 )
-                LoraLayer.__init__(
-                    self,
-                    in_features=in_features,
-                    out_features=out_features,
-                    fan_in_fan_out=fan_in_fan_out,
-                    custom=self.custom,
-                )
+                LoraLayer.__init__(self, in_features=in_features, out_features=out_features)
 
                 # Freezing the pre-trained weight matrix
                 self.weight.requires_grad = False
 
                 init_lora_weights = kwargs.pop("init_lora_weights", True)
-                self.fan_in_fan_out = fan_in_fan_out
-                if fan_in_fan_out:
-                    raise "fan_in_fan_out"
-                    self.weight.data = self.weight.data.T
-
                 self.update_layer(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights)
                 self.active_adapter = adapter_name
 
@@ -1482,58 +1123,24 @@ if is_bnb_available():
                 result = super().forward(x)
 
                 if self.disable_adapters or self.active_adapter not in self.lora_A.keys():
-                    raise NotImplementedError()
                     return result
                 elif self.r[self.active_adapter] > 0:
                     result = result.clone()
                     if not torch.is_autocast_enabled():
                         expected_dtype = result.dtype
                         x = x.to(self.lora_A[self.active_adapter].weight.dtype)
-
-                        x = self.lora_dropout[self.active_adapter](x)
-
-                        if self.custom["mode"] == "lora":
-                            result += (
-                                self.lora_B[self.active_adapter](self.lora_A[self.active_adapter](x))
-                                * self.scaling[self.active_adapter]
+                        output = (
+                            self.lora_B[self.active_adapter](
+                                self.lora_A[self.active_adapter](self.lora_dropout[self.active_adapter](x))
                             ).to(expected_dtype)
-
-                            if self.custom["identity"]:
-                                _x2 = x @ self._A.T
-                                _x2 = _x2 @ self._B.T
-                                result -= _x2.to(expected_dtype)
-                        elif self.custom["mode"] == "elora":
-                            result += (
-                                self.lora_db[self.active_adapter]
-                                * self.lora_B[self.active_adapter](
-                                    self.lora_d[self.active_adapter] * self.lora_A[self.active_adapter](x)
-                                )
-                            ).to(expected_dtype)
-
-                            if self.custom["identity"]:
-                                raise NotImplementedError()
-                        else:
-                            raise NotImplementedError()
+                            * self.scaling[self.active_adapter]
+                        )
                     else:
-                        x = self.lora_dropout[self.active_adapter](x)
-
-                        if self.custom["mode"] == "lora":
-                            result += (
-                                self.lora_B[self.active_adapter](self.lora_A[self.active_adapter](x))
-                                * self.scaling[self.active_adapter]
+                        output = (
+                            self.lora_B[self.active_adapter](
+                                self.lora_A[self.active_adapter](self.lora_dropout[self.active_adapter](x))
                             )
-
-                            if self.custom["identity"]:
-                                _x2 = x @ self._A.T
-                                _x2 = _x2 @ self._B.T
-                                result -= _x2
-                        elif self.custom["mode"] == "elora":
-                            result += self.lora_db[self.active_adapter] * self.lora_B[self.active_adapter](
-                                self.lora_d[self.active_adapter] * self.lora_A[self.active_adapter](x)
-                            )
-
-                            if self.custom["identity"]:
-                                raise NotImplementedError()
-                        else:
-                            raise NotImplementedError()
+                            * self.scaling[self.active_adapter]
+                        )
+                    result += output
                 return result
