@@ -1,0 +1,51 @@
+2024-04-03 22:29:38 INFO open for scan: /zhujiajun/ThesisLoRA/repos/VeRA/instruct/wandb/offline-run-20240403_205708-u11lvvda/run-u11lvvda.wandb
+2024-04-03 22:29:38 INFO watching files in: /zhujiajun/ThesisLoRA/repos/VeRA/instruct/wandb/offline-run-20240403_205708-u11lvvda/files
+2024-04-03 22:29:38 INFO run started: u11lvvda with start time 1712149028
+2024-04-03 22:29:38 INFO saving file wandb-metadata.json with policy now
+2024-04-03 22:29:38 WARNING Seen metric with glob (shouldn't happen)
+2024-04-03 22:29:39 INFO Uploaded file /tmp/tmp5uiml08lwandb/jgy2ca6o-wandb-metadata.json
+2024-04-03 22:29:41 INFO Uploaded file /root/.cache/wandb/artifacts/obj/md5/31/f48c6a1a55c4543e8a2f354693fb03
+2024-04-03 22:29:42 INFO sent artifact run-u11lvvda-generations - {'id': 'QXJ0aWZhY3Q6NzgxMTM2ODc4', 'digest': '2d2e707b3e169076d63d6c6e40baadcc', 'state': 'PENDING', 'aliases': [], 'artifactSequence': {'id': 'QXJ0aWZhY3RDb2xsZWN0aW9uOjE1NTgxMDg2Mg==', 'latestArtifact': None}, 'version': 'latest'}
+2024-04-03 22:29:42 INFO saving file media/table/generations_786_97ce5d344d275e35599a.table.json with policy now
+2024-04-03 22:29:42 INFO saving file wandb-summary.json with policy end
+2024-04-03 22:29:42 INFO handling exit code: 0
+2024-04-03 22:29:42 INFO handling runtime: 5347
+2024-04-03 22:29:42 INFO saving file wandb-summary.json with policy end
+2024-04-03 22:29:42 INFO send defer
+2024-04-03 22:29:42 INFO handle sender defer: 0
+2024-04-03 22:29:42 INFO send defer: 1
+2024-04-03 22:29:42 INFO handle sender defer: 1
+2024-04-03 22:29:42 INFO send defer: 2
+2024-04-03 22:29:42 INFO handle sender defer: 2
+2024-04-03 22:29:42 INFO send defer: 3
+2024-04-03 22:29:42 INFO handle sender defer: 3
+2024-04-03 22:29:42 INFO send defer: 4
+2024-04-03 22:29:42 INFO handle sender defer: 4
+2024-04-03 22:29:42 INFO send defer: 5
+2024-04-03 22:29:42 INFO handle sender defer: 5
+2024-04-03 22:29:42 INFO file/dir modified: /zhujiajun/ThesisLoRA/repos/VeRA/instruct/wandb/offline-run-20240403_205708-u11lvvda/files/wandb-summary.json
+2024-04-03 22:29:43 INFO send defer: 6
+2024-04-03 22:29:43 INFO handle sender defer: 6
+2024-04-03 22:29:43 INFO shutting down directory watcher
+2024-04-03 22:29:43 INFO file/dir modified: /zhujiajun/ThesisLoRA/repos/VeRA/instruct/wandb/offline-run-20240403_205708-u11lvvda/files/config.yaml
+2024-04-03 22:29:43 INFO scan: /zhujiajun/ThesisLoRA/repos/VeRA/instruct/wandb/offline-run-20240403_205708-u11lvvda/files
+2024-04-03 22:29:43 INFO scan save: /zhujiajun/ThesisLoRA/repos/VeRA/instruct/wandb/offline-run-20240403_205708-u11lvvda/files/wandb-metadata.json wandb-metadata.json
+2024-04-03 22:29:43 INFO scan save: /zhujiajun/ThesisLoRA/repos/VeRA/instruct/wandb/offline-run-20240403_205708-u11lvvda/files/config.yaml config.yaml
+2024-04-03 22:29:43 INFO scan save: /zhujiajun/ThesisLoRA/repos/VeRA/instruct/wandb/offline-run-20240403_205708-u11lvvda/files/requirements.txt requirements.txt
+2024-04-03 22:29:43 INFO scan save: /zhujiajun/ThesisLoRA/repos/VeRA/instruct/wandb/offline-run-20240403_205708-u11lvvda/files/wandb-summary.json wandb-summary.json
+2024-04-03 22:29:43 INFO scan save: /zhujiajun/ThesisLoRA/repos/VeRA/instruct/wandb/offline-run-20240403_205708-u11lvvda/files/output.log output.log
+2024-04-03 22:29:43 INFO scan save: /zhujiajun/ThesisLoRA/repos/VeRA/instruct/wandb/offline-run-20240403_205708-u11lvvda/files/conda-environment.yaml conda-environment.yaml
+2024-04-03 22:29:43 INFO scan save: /zhujiajun/ThesisLoRA/repos/VeRA/instruct/wandb/offline-run-20240403_205708-u11lvvda/files/media/table/generations_786_97ce5d344d275e35599a.table.json media/table/generations_786_97ce5d344d275e35599a.table.json
+2024-04-03 22:29:43 INFO send defer: 7
+2024-04-03 22:29:43 INFO handle sender defer: 7
+2024-04-03 22:29:43 INFO shutting down file pusher
+2024-04-03 22:29:43 INFO shutting down sender
+2024-04-03 22:29:43 INFO shutting down file pusher
+2024-04-03 22:29:43 INFO waiting for file pusher
+2024-04-03 22:29:44 INFO Uploaded file /tmp/tmp5uiml08lwandb/07xenwk6-media/table/generations_786_97ce5d344d275e35599a.table.json
+2024-04-03 22:29:44 INFO Uploaded file /zhujiajun/ThesisLoRA/repos/VeRA/instruct/wandb/offline-run-20240403_205708-u11lvvda/files/requirements.txt
+2024-04-03 22:29:45 INFO Uploaded file /zhujiajun/ThesisLoRA/repos/VeRA/instruct/wandb/offline-run-20240403_205708-u11lvvda/files/config.yaml
+2024-04-03 22:29:45 INFO Uploaded file /zhujiajun/ThesisLoRA/repos/VeRA/instruct/wandb/offline-run-20240403_205708-u11lvvda/files/wandb-summary.json
+2024-04-03 22:29:45 INFO Uploaded file /zhujiajun/ThesisLoRA/repos/VeRA/instruct/wandb/offline-run-20240403_205708-u11lvvda/files/conda-environment.yaml
+2024-04-03 22:29:45 INFO Uploaded file /zhujiajun/ThesisLoRA/repos/VeRA/instruct/wandb/offline-run-20240403_205708-u11lvvda/files/output.log
+2024-04-03 22:29:45 INFO send defer: 8
